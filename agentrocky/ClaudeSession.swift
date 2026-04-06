@@ -114,13 +114,11 @@ class ClaudeSession: ObservableObject {
         do {
             try proc.run()
             self.process = proc
-            append("Starting claude…", kind: .system)
 
             // Fallback: if init event never arrives, mark ready after 4s
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
                 guard let self, !self.isReady else { return }
                 self.isReady = true
-                self.append("Ready (fallback)", kind: .system)
             }
         } catch {
             append("Failed to launch claude: \(error.localizedDescription)", kind: .error)
@@ -160,7 +158,6 @@ class ClaudeSession: ObservableObject {
 
             case "system" where subtype == "init":
                 self?.isReady = true
-                self?.append("Session ready", kind: .system)
 
             case "assistant":
                 guard let message = json["message"] as? [String: Any],
@@ -182,7 +179,7 @@ class ClaudeSession: ObservableObject {
         case "text":
             if let text = block["text"] as? String,
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                append(text, kind: .text)
+                append("rocky: \(text)", kind: .text)
             }
 
         case "tool_use":
