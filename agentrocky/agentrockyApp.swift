@@ -16,6 +16,7 @@ struct agentrockyApp: App {
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     var rockyWindow: NSPanel?
     var rockyState = RockyState()
@@ -23,16 +24,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var walkTimer: Timer?
     private var frameTimer: Timer?
     private let rockyWidth: CGFloat = 180
-    private let rockyHeight: CGFloat = 140
+    private let rockyHeight: CGFloat = 176
     private let walkSpeed: CGFloat = 100
     private var lastTick: Date = Date()
 
     private var jazzWorkItem: DispatchWorkItem?
     private var bubbleWorkItem: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
+    private var liveLocalKeyMonitor: Any?
+    private var liveGlobalKeyMonitor: Any?
+    private var liveKeyIsHeld = false
 
-    private let workingMessages = ["rocky building", "rocky do big science", "rocky save erid"]
-    private let jazzMessages = ["fist my bump", "amaze amaze amaze", "rocky hate mark"]
+    private let workingMessages = ["rocky thinking", "one tiny moment", "rocky has this"]
+    private let speakingMessages = ["rocky says", "rocky voice", "answer coming"]
+    private let jazzMessages = ["fist my bump", "amaze amaze amaze", "rocky says hi"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -40,6 +45,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startWalking()
         setupJazzTriggers()
         setupSpeechBubble()
+        setupSpeakingBubble()
+        setupLiveStatusBubble()
+        setupMoodAndActions()
+        setupLivePushToTalkKey()
+        rockyState.session.prepareMicrophonePermission()
     }
 
     // MARK: - Window
@@ -67,7 +77,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             rockyState.dockY = dockTop
         }
 
-        let contentView = NSHostingView(rootView: RockyView(state: rockyState))
+        let contentView = NSHostingView(rootView: RockyView(state: rockyState, session: rockyState.session))
         contentView.frame = panel.contentView!.bounds
         contentView.autoresizingMask = [.width, .height]
         panel.contentView = contentView
@@ -82,10 +92,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lastTick = Date()
 
         walkTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            self?.updatePosition()
+            guard let self else { return }
+            Task { @MainActor [weak self] in self?.updatePosition() }
         }
         frameTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 8.0, repeats: true) { [weak self] _ in
-            self?.updateFrame()
+            guard let self else { return }
+            Task { @MainActor [weak self] in self?.updateFrame() }
         }
     }
 
@@ -122,7 +134,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Jazz
 
     private func setupJazzTriggers() {
-        // Jazz when a Claude task finishes
+        // Jazz when a Gemini reply finishes.
         rockyState.session.$isRunning
             .removeDuplicates()
             .dropFirst()                    // skip the initial false
@@ -147,10 +159,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     withAnimation {
                         self.rockyState.speechBubble = self.workingMessages.randomElement()!
                     }
-                } else {
-                    withAnimation {
-                        self.rockyState.speechBubble = "rocky done!"
-                    }
+                } else if !self.rockyState.session.isSpeaking && !self.rockyState.session.isLiveReplying {
                     let work = DispatchWorkItem { [weak self] in
                         withAnimation { self?.rockyState.speechBubble = nil }
                     }
@@ -159,6 +168,137 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
+    }
+
+    private func setupSpeakingBubble() {
+        rockyState.session.$isSpeaking
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] speaking in
+                guard let self else { return }
+                self.bubbleWorkItem?.cancel()
+
+                if speaking {
+                    withAnimation {
+                        self.rockyState.speechBubble = self.rockyState.session.lastSpeechBubble ?? self.speakingMessages.randomElement()!
+                    }
+                } else if !self.rockyState.session.isRunning && !self.rockyState.session.isLiveReplying {
+                    let work = DispatchWorkItem { [weak self] in
+                        withAnimation { self?.rockyState.speechBubble = nil }
+                    }
+                    self.bubbleWorkItem = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func setupLiveStatusBubble() {
+        rockyState.session.$liveStatus
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                guard let self else { return }
+                switch status {
+                case "live listening":
+                    self.showSpeechBubble("listening...", clearAfter: nil)
+                case "live thinking":
+                    self.showSpeechBubble("rocky thinking", clearAfter: nil)
+                case "live replying":
+                    self.showSpeechBubble(self.rockyState.session.lastSpeechBubble ?? "rocky says", clearAfter: nil)
+                case "live ready":
+                    if !self.rockyState.session.isLiveReplying {
+                        self.clearSpeechBubble(after: 1.4)
+                    }
+                default:
+                    break
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func setupMoodAndActions() {
+        rockyState.session.$lastSpeechBubble
+            .dropFirst()
+            .compactMap { $0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] bubble in
+                guard let self else { return }
+                self.bubbleWorkItem?.cancel()
+                self.showSpeechBubble(bubble, clearAfter: self.rockyState.session.isLiveReplying ? nil : 3.5)
+            }
+            .store(in: &cancellables)
+
+        rockyState.session.$lastAction
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] action in
+                guard let self else { return }
+                switch action {
+                case .dance:
+                    self.startJazz(duration: 3.0)
+                case .think:
+                    withAnimation { self.rockyState.speechBubble = "rocky thinking" }
+                case .pause:
+                    self.rockyState.isPaused = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        self?.rockyState.isPaused = false
+                    }
+                case .wave:
+                    self.startJazz(duration: 1.2)
+                case .none:
+                    break
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func setupLivePushToTalkKey() {
+        liveLocalKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            guard let self else { return event }
+            self.handleLiveKeyEvent(event)
+            return event
+        }
+
+        liveGlobalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleLiveKeyEvent(event)
+            }
+        }
+    }
+
+    private func handleLiveKeyEvent(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let optionIsDown = flags.contains(.option)
+        let canUseLiveKey = rockyState.session.isLiveConnected
+
+        if optionIsDown, canUseLiveKey, !liveKeyIsHeld {
+            liveKeyIsHeld = true
+            rockyState.session.startLiveListening()
+        } else if (!optionIsDown || !canUseLiveKey), liveKeyIsHeld {
+            liveKeyIsHeld = false
+            rockyState.session.stopLiveListening()
+        }
+    }
+
+    private func showSpeechBubble(_ text: String, clearAfter delay: TimeInterval?) {
+        bubbleWorkItem?.cancel()
+        withAnimation {
+            rockyState.speechBubble = text
+        }
+        if let delay {
+            clearSpeechBubble(after: delay)
+        }
+    }
+
+    private func clearSpeechBubble(after delay: TimeInterval) {
+        bubbleWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation { self?.rockyState.speechBubble = nil }
+        }
+        bubbleWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func startJazz(duration: TimeInterval) {
